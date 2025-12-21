@@ -30,13 +30,13 @@
 // ---------------------------
 static const int PIN_UP    = 13;
 static const int PIN_DOWN  = 12;
-static const int PIN_LEFT  = 15;
-static const int PIN_RIGHT = 14;
+static const int PIN_LEFT  = 14;
+static const int PIN_RIGHT = 15;
 
 // ---------------------------
 // Camera / performance
 // ---------------------------
-static const framesize_t FRAME_SIZE = FRAMESIZE_QVGA;     // 320x240 (good compromise)
+static const framesize_t FRAME_SIZE = FRAMESIZE_VGA;     // 320x240 (good compromise)
 static const pixformat_t PIXFORMAT  = PIXFORMAT_RGB565;   // direct for detector
 static const int         XCLK_FREQ  = 20000000;
 static const int         DETECT_EVERY_N = 2;              // detect every Nth frame
