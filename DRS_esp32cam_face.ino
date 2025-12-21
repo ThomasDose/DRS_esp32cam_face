@@ -30,8 +30,8 @@
 // Vertical: GPIO22/GPIO27
 // Horizontal: GPIO23/GPIO24
 // ---------------------------
-static const int PIN_V1 = 12;  // UP
-static const int PIN_V2 = 13;  // DOWN
+static const int PIN_V1 = 13;  // UP
+static const int PIN_V2 = 12;  // DOWN
 static const int PIN_H1 = 14;  // LEFT
 static const int PIN_H2 = 15;  // RIGH
 
