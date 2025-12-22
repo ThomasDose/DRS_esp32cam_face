@@ -1,3 +1,23 @@
+/*
+  DRS_ESP32CAM_FaceMotorTiming_PULSE_STBY.ino
+  - AI-Thinker ESP32-CAM (OV2640)
+  - NO WiFi, NO Webserver, NO streaming
+  - Face detection (MSR01) -> motor PULSE outputs
+  - TB726A3: STBY is controlled by ESP32 GPIO2 (IO2)
+  - Serial prints ONLY when a motor pulse is emitted, and prints DT between pulses.
+
+  Wiring (as you described):
+    UP    -> GPIO13
+    DOWN  -> GPIO12
+    LEFT  -> GPIO14
+    RIGHT -> GPIO15
+    STBY  -> GPIO2
+
+  Hardware MUST:
+    - common GND between ESP32 and driver
+    - add pull-down resistors (recommended 10k) on IN pins + STBY to prevent floating/boot glitches
+*/
+
 #include <Arduino.h>
 #include <list>
 
@@ -25,13 +45,13 @@
 #define PCLK_GPIO_NUM     22
 
 // ---------------------------
-// Motor GPIOs (your wiring)
-// 13=UP, 12=DOWN, 14/15 horizontal
+// TB726A3 Driver pins (your wiring)
 // ---------------------------
 static const int PIN_UP    = 13;
 static const int PIN_DOWN  = 12;
 static const int PIN_LEFT  = 14;
 static const int PIN_RIGHT = 15;
+static const int PIN_STBY  = 2;   // IO2 -> STBY
 
 // ---------------------------
 // Camera / performance
@@ -41,17 +61,16 @@ static const pixformat_t PIXFORMAT  = PIXFORMAT_RGB565;   // direct for detector
 static const int         XCLK_FREQ  = 20000000;
 static const int         DETECT_EVERY_N = 2;              // detect every Nth frame
 
-// Detector strictness (less false positives)
+// Detector strictness (less sensitive, fewer false positives)
 static HumanFaceDetectMSR01 detector(0.15F, 0.5F, 10, 0.2F);
 
 // ---------------------------
-// Control tuning (THIS is what fixes "too long")
+// Control tuning (prevents overshoot)
 // ---------------------------
-static const int DEADZONE_X = 22;           // pixels around center => no horizontal pulses
-static const int DEADZONE_Y = 22;           // pixels around center => no vertical pulses
-
-static const uint32_t PULSE_MS        = 20; // motor ON-time per step (try 10..30)
-static const uint32_t MIN_INTERVAL_MS = 120; // min time between pulses (try 80..200)
+static const int DEADZONE_X = 22;            // px around center
+static const int DEADZONE_Y = 22;            // px around center
+static const uint32_t PULSE_MS        = 20;  // motor ON-time per step (try 10..30)
+static const uint32_t MIN_INTERVAL_MS = 120; // min time between pulses (try 80..250)
 
 // ---------------------------
 // State
@@ -61,8 +80,8 @@ enum Dir : int8_t { DIR_NONE=0, DIR_LEFT=-1, DIR_RIGHT=+1, DIR_UP=-2, DIR_DOWN=+
 static uint32_t frameNo = 0;
 static bool     lastHadFace = false;
 static int      lastCx = 0, lastCy = 0;
-static uint32_t lastPulseMs = 0;     // for MIN_INTERVAL_MS gating
-static uint32_t lastSignalMs = 0;    // for DT measurement
+static uint32_t lastPulseMs  = 0;   // for MIN_INTERVAL_MS gating
+static uint32_t lastSignalMs = 0;   // DT between emitted motor pulses
 
 // ---------------------------
 // Helpers
@@ -74,8 +93,13 @@ static void motor_all_stop() {
   digitalWrite(PIN_RIGHT, LOW);
 }
 
+static void driver_enable(bool on) {
+  digitalWrite(PIN_STBY, on ? HIGH : LOW);
+}
+
 static void motor_pulse(Dir d) {
-  // direction pins are mutually exclusive per axis
+  // If driver is disabled, do nothing
+  // (but we still keep the logic clean and explicit)
   motor_all_stop();
 
   switch (d) {
@@ -164,6 +188,7 @@ static bool init_camera() {
     s->set_exposure_ctrl(s, 1);
     s->set_awb_gain(s, 1);
   }
+
   return true;
 }
 
@@ -176,6 +201,7 @@ static void bestFace(std::list<dl::detect::result_t> &results,
     int b0=r.box[0], b1=r.box[1], b2=r.box[2], b3=r.box[3];
     int xx, yy, ww, hh;
 
+    // handle both common formats
     if (b2 > b0 && b3 > b1) {        // x1,y1,x2,y2
       xx=b0; yy=b1; ww=b2-b0; hh=b3-b1;
     } else {                         // x,y,w,h
@@ -192,10 +218,9 @@ static void bestFace(std::list<dl::detect::result_t> &results,
   }
 }
 
-static Dir decide_direction(int cx, int cy, int w, int h) {
-  // choose ONE axis per pulse: whichever error is bigger (prevents diagonals)
-  int centerX = w / 2;
-  int centerY = h / 2;
+static Dir decide_direction(int cx, int cy, int imgW, int imgH) {
+  int centerX = imgW / 2;
+  int centerY = imgH / 2;
 
   int dx = cx - centerX; // + => face right
   int dy = cy - centerY; // + => face down
@@ -208,6 +233,7 @@ static Dir decide_direction(int cx, int cy, int w, int h) {
 
   if (!needH && !needV) return DIR_NONE;
 
+  // Choose ONE axis per pulse: whichever error is bigger
   if (needH && (!needV || adx >= ady)) {
     return (dx < 0) ? DIR_LEFT : DIR_RIGHT;
   } else {
@@ -219,6 +245,10 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   setCpuFrequencyMhz(240);
+
+  // GPIO setup: keep driver disabled during boot/init
+  pinMode(PIN_STBY, OUTPUT);
+  driver_enable(false);
 
   pinMode(PIN_UP, OUTPUT);
   pinMode(PIN_DOWN, OUTPUT);
@@ -236,9 +266,14 @@ void setup() {
     while (true) delay(1000);
   }
 
-  lastPulseMs  = millis();
-  lastSignalMs = lastPulseMs;
-  Serial.println("OK. PULSE control active. Serial prints ONLY when a pulse is emitted.");
+  // Now enable driver in a controlled way
+  driver_enable(true);
+
+  uint32_t now = millis();
+  lastPulseMs  = now;
+  lastSignalMs = now;
+
+  Serial.println("OK. PULSE control active. STBY=IO2. Serial prints ONLY when a motor pulse is emitted.");
 }
 
 void loop() {
@@ -266,30 +301,31 @@ void loop() {
     }
   }
 
-  int w = fb->width;
-  int h = fb->height;
+  int imgW = fb->width;
+  int imgH = fb->height;
 
   esp_camera_fb_return(fb);
 
-  // Only consider pulsing if we have a face
+  // Only pulse if we have a face
   if (!lastHadFace) return;
 
   // Rate limit pulses
   uint32_t now = millis();
   if (now - lastPulseMs < MIN_INTERVAL_MS) return;
 
-  Dir d = decide_direction(lastCx, lastCy, w, h);
+  Dir d = decide_direction(lastCx, lastCy, imgW, imgH);
   if (d == DIR_NONE) return;
 
-  // Emit pulse + timing
+  // Measure time between emitted motor pulses
   uint32_t dt = now - lastSignalMs;
   lastSignalMs = now;
   lastPulseMs  = now;
 
+  // Emit pulse
   motor_pulse(d);
 
   // Serial ONLY when we pulsed
   Serial.printf("DT %lu  PULSE=%s  FACE %d %d  IMG %dx%d\n",
                 (unsigned long)dt, dir_to_str(d),
-                lastCx, lastCy, w, h);
+                lastCx, lastCy, imgW, imgH);
 }
