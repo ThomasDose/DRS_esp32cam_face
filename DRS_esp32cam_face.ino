@@ -1,32 +1,30 @@
 /*
-  DRS_ESP32CAM_FaceMotorTiming_PULSE_STBY.ino
+  DRS_ESP32CAM_VGA_DRV8833_FACE_BRAKE_CONTINUOUS_0DEG.ino
+
   - AI-Thinker ESP32-CAM (OV2640)
-  - NO WiFi, NO Webserver, NO streaming
-  - Face detection (MSR01) -> motor PULSE outputs
-  - TB726A3: STBY is controlled by ESP32 GPIO2 (IO2)
-  - Serial prints ONLY when a motor pulse is emitted, and prints DT between pulses.
+  - VGA 640x480, RGB565
+  - Face detect MSR01 (full frame)
+  - DRV8833 motor driver
+  - CONTINUOUS motor drive + short ACTIVE BRAKE
+  - Anti-pendulum: hysteresis + minimum hold time (H + V)
+  - LED (GPIO4): VERY DIM ON if face detected, OFF otherwise
+  - NO SERIAL OUTPUT
 
-  Wiring (as you described):
-    UP    -> GPIO13
-    DOWN  -> GPIO12
-    LEFT  -> GPIO14
-    RIGHT -> GPIO15
-    STBY  -> GPIO2
-
-  Hardware MUST:
-    - common GND between ESP32 and driver
-    - add pull-down resistors (recommended 10k) on IN pins + STBY to prevent floating/boot glitches
+  Wiring:
+    Vertical motor:
+      UP    -> GPIO13
+      DOWN  -> GPIO12
+    Horizontal motor:
+      LEFT  -> GPIO14
+      RIGHT -> GPIO15
 */
 
 #include <Arduino.h>
 #include <list>
-
 #include "esp_camera.h"
 #include "human_face_detect_msr01.hpp"
 
-// ---------------------------
-// AI-Thinker ESP32-CAM pin map (OV2640)
-// ---------------------------
+/* ===== Camera pins (AI Thinker ESP32-CAM) ===== */
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -44,288 +42,264 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ---------------------------
-// TB726A3 Driver pins (your wiring)
-// ---------------------------
+/* ===== Motor & LED pins ===== */
 static const int PIN_UP    = 13;
 static const int PIN_DOWN  = 12;
 static const int PIN_LEFT  = 14;
 static const int PIN_RIGHT = 15;
-static const int PIN_STBY  = 2;   // IO2 -> STBY
+static const int PIN_LED   = 4;
 
-// ---------------------------
-// Camera / performance
-// ---------------------------
-static const framesize_t FRAME_SIZE = FRAMESIZE_VGA;     // 320x240 (good compromise)
-static const pixformat_t PIXFORMAT  = PIXFORMAT_RGB565;   // direct for detector
+/* ===== LED PWM ===== */
+static const int LEDC_CH   = 7;
+static const int LEDC_FREQ = 5000;
+static const int LEDC_RES  = 8;
+static const uint8_t LED_DIM = 1;   // very dim (0..255)
+
+/* ===== Camera config ===== */
+static const framesize_t FRAME_SIZE = FRAMESIZE_VGA;   // 640x480
+static const pixformat_t PIXFORMAT  = PIXFORMAT_RGB565;
 static const int         XCLK_FREQ  = 20000000;
-static const int         DETECT_EVERY_N = 2;              // detect every Nth frame
 
-// Detector strictness (less sensitive, fewer false positives)
+/* ===== Face detector ===== */
 static HumanFaceDetectMSR01 detector(0.15F, 0.5F, 10, 0.2F);
 
-// ---------------------------
-// Control tuning (prevents overshoot)
-// ---------------------------
-static const int DEADZONE_X = 22;            // px around center
-static const int DEADZONE_Y = 22;            // px around center
-static const uint32_t PULSE_MS        = 20;  // motor ON-time per step (try 10..30)
-static const uint32_t MIN_INTERVAL_MS = 120; // min time between pulses (try 80..250)
+/* ===== Control tuning ===== */
+static const int DEADZONE_X = 60;
+static const int DEADZONE_Y = 40;
+static const uint32_t DETECT_MIN_MS = 30;
+static const uint8_t  LOSE_AFTER_MISSES = 2;
 
-// ---------------------------
-// State
-// ---------------------------
-enum Dir : int8_t { DIR_NONE=0, DIR_LEFT=-1, DIR_RIGHT=+1, DIR_UP=-2, DIR_DOWN=+2 };
+/* ===== Anti-pendulum (both axes) =====
+   HYST_* adds extra pixels beyond deadzone before allowing movement on that axis
+   HOLD_DIR_MS_* prevents rapid direction flip-flops on that axis
+*/
+static const int      HYST_X = 45;         // try 30..80
+static const int      HYST_Y = 35;         // try 20..70 (usually a bit smaller)
+static const uint32_t HOLD_DIR_MS_H = 100; // try 150..400
+static const uint32_t HOLD_DIR_MS_V = 100; // try 120..350
 
-static uint32_t frameNo = 0;
-static bool     lastHadFace = false;
-static int      lastCx = 0, lastCy = 0;
-static uint32_t lastPulseMs  = 0;   // for MIN_INTERVAL_MS gating
-static uint32_t lastSignalMs = 0;   // DT between emitted motor pulses
+/* ===== Brake tuning ===== */
+static const uint32_t BRAKE_MS_V = 35;   // vertical
+static const uint32_t BRAKE_MS_H = 70;   // horizontal (stronger)
 
-// ---------------------------
-// Helpers
-// ---------------------------
-static void motor_all_stop() {
-  digitalWrite(PIN_UP,    LOW);
-  digitalWrite(PIN_DOWN,  LOW);
-  digitalWrite(PIN_LEFT,  LOW);
+enum Dir : int8_t {
+  DIR_NONE  = 0,
+  DIR_LEFT  = -1,
+  DIR_RIGHT = +1,
+  DIR_UP    = -2,
+  DIR_DOWN  = +2
+};
+
+/* ===== State ===== */
+static uint32_t lastDetectMs = 0;
+static uint8_t  missCount   = 0;
+static int imgW = 640, imgH = 480;
+static Dir lastDir = DIR_NONE;
+
+// axis memory
+static Dir lastHDir = DIR_NONE;
+static uint32_t lastHChangeMs = 0;
+static Dir lastVDir = DIR_NONE;
+static uint32_t lastVChangeMs = 0;
+
+/* ===== LED ===== */
+static void led_pwm_init() {
+  ledcSetup(LEDC_CH, LEDC_FREQ, LEDC_RES);
+  ledcAttachPin(PIN_LED, LEDC_CH);
+  ledcWrite(LEDC_CH, 0);
+}
+static inline void led_on()  { ledcWrite(LEDC_CH, LED_DIM); }
+static inline void led_off() { ledcWrite(LEDC_CH, 0); }
+
+/* ===== Motor helpers ===== */
+static inline void motor_coast() {
+  digitalWrite(PIN_UP, LOW);
+  digitalWrite(PIN_DOWN, LOW);
+  digitalWrite(PIN_LEFT, LOW);
   digitalWrite(PIN_RIGHT, LOW);
 }
 
-static void driver_enable(bool on) {
-  digitalWrite(PIN_STBY, on ? HIGH : LOW);
+static inline void brake_vertical() {
+  digitalWrite(PIN_UP, HIGH);
+  digitalWrite(PIN_DOWN, HIGH);
 }
 
-static void motor_pulse(Dir d) {
-  // If driver is disabled, do nothing
-  // (but we still keep the logic clean and explicit)
-  motor_all_stop();
-
-  switch (d) {
-    case DIR_UP:
-      digitalWrite(PIN_UP, HIGH);
-      digitalWrite(PIN_DOWN, LOW);
-      break;
-    case DIR_DOWN:
-      digitalWrite(PIN_UP, LOW);
-      digitalWrite(PIN_DOWN, HIGH);
-      break;
-    case DIR_LEFT:
-      digitalWrite(PIN_LEFT, HIGH);
-      digitalWrite(PIN_RIGHT, LOW);
-      break;
-    case DIR_RIGHT:
-      digitalWrite(PIN_LEFT, LOW);
-      digitalWrite(PIN_RIGHT, HIGH);
-      break;
-    default:
-      return;
-  }
-
-  delay(PULSE_MS);
-  motor_all_stop();
+static inline void brake_horizontal() {
+  digitalWrite(PIN_LEFT, HIGH);
+  digitalWrite(PIN_RIGHT, HIGH);
 }
 
-static const char* dir_to_str(Dir d) {
-  switch (d) {
-    case DIR_UP: return "UP";
-    case DIR_DOWN: return "DOWN";
-    case DIR_LEFT: return "LEFT";
-    case DIR_RIGHT: return "RIGHT";
-    default: return "NONE";
+static inline void motor_drive(Dir d) {
+  motor_coast();
+  switch(d) {
+    case DIR_UP:    digitalWrite(PIN_UP, HIGH);    break;
+    case DIR_DOWN:  digitalWrite(PIN_DOWN, HIGH);  break;
+    case DIR_LEFT:  digitalWrite(PIN_LEFT, HIGH);  break;
+    case DIR_RIGHT: digitalWrite(PIN_RIGHT, HIGH); break;
+    default: break;
   }
 }
 
+/* ===== Camera init ===== */
 static bool init_camera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
+  camera_config_t c;
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.ledc_timer   = LEDC_TIMER_0;
 
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
+  c.pin_d0 = Y2_GPIO_NUM; c.pin_d1 = Y3_GPIO_NUM;
+  c.pin_d2 = Y4_GPIO_NUM; c.pin_d3 = Y5_GPIO_NUM;
+  c.pin_d4 = Y6_GPIO_NUM; c.pin_d5 = Y7_GPIO_NUM;
+  c.pin_d6 = Y8_GPIO_NUM; c.pin_d7 = Y9_GPIO_NUM;
 
-  config.pin_xclk  = XCLK_GPIO_NUM;
-  config.pin_pclk  = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href  = HREF_GPIO_NUM;
+  c.pin_xclk = XCLK_GPIO_NUM;
+  c.pin_pclk = PCLK_GPIO_NUM;
+  c.pin_vsync = VSYNC_GPIO_NUM;
+  c.pin_href = HREF_GPIO_NUM;
+  c.pin_sscb_sda = SIOD_GPIO_NUM;
+  c.pin_sscb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn = PWDN_GPIO_NUM;
+  c.pin_reset = RESET_GPIO_NUM;
 
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  c.xclk_freq_hz = XCLK_FREQ;
+  c.pixel_format = PIXFORMAT;
+  c.frame_size = FRAME_SIZE;
+  c.jpeg_quality = 12;
+  c.fb_location = CAMERA_FB_IN_PSRAM;
+  c.grab_mode = CAMERA_GRAB_LATEST;
+  c.fb_count = 2;
 
-  config.pin_pwdn  = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-
-  config.xclk_freq_hz = XCLK_FREQ;
-  config.pixel_format = PIXFORMAT;
-  config.frame_size   = FRAME_SIZE;
-
-  config.jpeg_quality = 12;                 // ignored for RGB565
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.grab_mode    = CAMERA_GRAB_LATEST;
-  config.fb_count     = 1;
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("CAM init failed: 0x%x\n", err);
-    return false;
-  }
+  if (esp_camera_init(&c) != ESP_OK) return false;
 
   sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-    s->set_framesize(s, FRAME_SIZE);
-    s->set_pixformat(s, PIXFORMAT);
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
-    s->set_saturation(s, 0);
-    s->set_gain_ctrl(s, 1);
-    s->set_exposure_ctrl(s, 1);
-    s->set_awb_gain(s, 1);
-  }
+  if (s) s->set_framesize(s, FRAME_SIZE);
 
   return true;
 }
 
-static void bestFace(std::list<dl::detect::result_t> &results,
-                     bool &hasFace, int &x, int &y, int &w, int &h) {
-  hasFace = false;
-  int bestArea = 0;
-
-  for (auto &r : results) {
-    int b0=r.box[0], b1=r.box[1], b2=r.box[2], b3=r.box[3];
-    int xx, yy, ww, hh;
-
-    // handle both common formats
-    if (b2 > b0 && b3 > b1) {        // x1,y1,x2,y2
-      xx=b0; yy=b1; ww=b2-b0; hh=b3-b1;
-    } else {                         // x,y,w,h
-      xx=b0; yy=b1; ww=b2; hh=b3;
-    }
-    if (ww<=0 || hh<=0) continue;
-
-    int area = ww*hh;
-    if (area > bestArea) {
-      bestArea = area;
-      x=xx; y=yy; w=ww; h=hh;
-      hasFace = true;
+/* ===== Face selection ===== */
+static bool bestFace(std::list<dl::detect::result_t>& r, int& cx, int& cy) {
+  int best = 0; bool found = false;
+  for (auto &f : r) {
+    int x=f.box[0], y=f.box[1], w=f.box[2]-f.box[0], h=f.box[3]-f.box[1];
+    int a=w*h;
+    if (a > best) {
+      best = a;
+      cx = x + w/2;
+      cy = y + h/2;
+      found = true;
     }
   }
+  return found;
 }
 
-static Dir decide_direction(int cx, int cy, int imgW, int imgH) {
-  int centerX = imgW / 2;
-  int centerY = imgH / 2;
+/* ===== Direction decision (0°) with anti-pendulum on both axes ===== */
+static Dir decide_dir(int cx, int cy) {
+  const int dx  = cx - imgW/2;
+  const int dy  = cy - imgH/2;
+  const int adx = abs(dx);
+  const int ady = abs(dy);
 
-  int dx = cx - centerX; // + => face right
-  int dy = cy - centerY; // + => face down
+  if (adx <= DEADZONE_X && ady <= DEADZONE_Y) return DIR_NONE;
 
-  int adx = abs(dx);
-  int ady = abs(dy);
+  const uint32_t now = millis();
 
-  bool needH = adx > DEADZONE_X;
-  bool needV = ady > DEADZONE_Y;
+  if (adx >= ady) {
+    // HORIZONTAL
+    if (adx < (DEADZONE_X + HYST_X)) return DIR_NONE;
 
-  if (!needH && !needV) return DIR_NONE;
+    Dir want = (dx < 0) ? DIR_LEFT : DIR_RIGHT;
 
-  // Choose ONE axis per pulse: whichever error is bigger
-  if (needH && (!needV || adx >= ady)) {
-    return (dx < 0) ? DIR_LEFT : DIR_RIGHT;
+    if ((lastHDir == DIR_LEFT && want == DIR_RIGHT) || (lastHDir == DIR_RIGHT && want == DIR_LEFT)) {
+      if (now - lastHChangeMs < HOLD_DIR_MS_H) return lastHDir;
+    }
+
+    if (want != lastHDir) { lastHDir = want; lastHChangeMs = now; }
+    return want;
+
   } else {
-    return (dy < 0) ? DIR_UP : DIR_DOWN;
+    // VERTICAL
+    if (ady < (DEADZONE_Y + HYST_Y)) return DIR_NONE;
+
+    Dir want = (dy < 0) ? DIR_UP : DIR_DOWN;
+
+    if ((lastVDir == DIR_UP && want == DIR_DOWN) || (lastVDir == DIR_DOWN && want == DIR_UP)) {
+      if (now - lastVChangeMs < HOLD_DIR_MS_V) return lastVDir;
+    }
+
+    if (want != lastVDir) { lastVDir = want; lastVChangeMs = now; }
+    return want;
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-  setCpuFrequencyMhz(240);
+/* ===== Apply with axis-specific brake ===== */
+static void apply_dir(Dir d) {
+  if (d == lastDir) {
+    if (d == DIR_NONE) motor_coast();
+    else motor_drive(d);
+    return;
+  }
 
-  // GPIO setup: keep driver disabled during boot/init
-  pinMode(PIN_STBY, OUTPUT);
-  driver_enable(false);
+  bool lastH = (lastDir==DIR_LEFT || lastDir==DIR_RIGHT);
+  bool lastV = (lastDir==DIR_UP   || lastDir==DIR_DOWN);
+  bool newH  = (d==DIR_LEFT || d==DIR_RIGHT);
+  bool newV  = (d==DIR_UP   || d==DIR_DOWN);
+
+  motor_coast();
+
+  if (lastH || newH) brake_horizontal();
+  if (lastV || newV) brake_vertical();
+
+  delay((lastH||newH) ? BRAKE_MS_H : BRAKE_MS_V);
+  motor_coast();
+
+  if (d != DIR_NONE) motor_drive(d);
+  lastDir = d;
+}
+
+/* ===== SETUP ===== */
+void setup() {
+  setCpuFrequencyMhz(240);
 
   pinMode(PIN_UP, OUTPUT);
   pinMode(PIN_DOWN, OUTPUT);
   pinMode(PIN_LEFT, OUTPUT);
   pinMode(PIN_RIGHT, OUTPUT);
-  motor_all_stop();
 
-  Serial.printf("PSRAM: %s size=%u free=%u\n",
-                psramFound() ? "YES" : "NO",
-                ESP.getPsramSize(),
-                ESP.getFreePsram());
+  motor_coast();
+  led_pwm_init();
+  led_off();
 
-  if (!init_camera()) {
-    Serial.println("Camera init FAILED.");
-    while (true) delay(1000);
-  }
+  if (!init_camera()) while(true) delay(1000);
 
-  // Now enable driver in a controlled way
-  driver_enable(true);
-
-  uint32_t now = millis();
-  lastPulseMs  = now;
-  lastSignalMs = now;
-
-  Serial.println("OK. PULSE control active. STBY=IO2. Serial prints ONLY when a motor pulse is emitted.");
+  lastDetectMs = millis();
 }
 
+/* ===== LOOP ===== */
 void loop() {
+  uint32_t now = millis();
+  if (now - lastDetectMs < DETECT_MIN_MS) return;
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  frameNo++;
-  bool doDetect = ((frameNo % DETECT_EVERY_N) == 0);
+  lastDetectMs = now;
+  imgW = fb->width;
+  imgH = fb->height;
 
-  if (doDetect) {
-    bool hasFace=false;
-    int x=0,y=0, bw=0,bh=0;
-
-    std::list<dl::detect::result_t> &results =
-      detector.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3});
-
-    bestFace(results, hasFace, x, y, bw, bh);
-
-    if (hasFace) {
-      lastCx = x + bw/2;
-      lastCy = y + bh/2;
-      lastHadFace = true;
-    } else {
-      lastHadFace = false;
-    }
-  }
-
-  int imgW = fb->width;
-  int imgH = fb->height;
-
+  auto &res = detector.infer((uint16_t*)fb->buf, {imgH, imgW, 3});
   esp_camera_fb_return(fb);
 
-  // Only pulse if we have a face
-  if (!lastHadFace) return;
-
-  // Rate limit pulses
-  uint32_t now = millis();
-  if (now - lastPulseMs < MIN_INTERVAL_MS) return;
-
-  Dir d = decide_direction(lastCx, lastCy, imgW, imgH);
-  if (d == DIR_NONE) return;
-
-  // Measure time between emitted motor pulses
-  uint32_t dt = now - lastSignalMs;
-  lastSignalMs = now;
-  lastPulseMs  = now;
-
-  // Emit pulse
-  motor_pulse(d);
-
-  // Serial ONLY when we pulsed
-  Serial.printf("DT %lu  PULSE=%s  FACE %d %d  IMG %dx%d\n",
-                (unsigned long)dt, dir_to_str(d),
-                lastCx, lastCy, imgW, imgH);
+  int cx=0, cy=0;
+  if (bestFace(res, cx, cy)) {
+    missCount = 0;
+    led_on();
+    apply_dir(decide_dir(cx, cy));
+  } else {
+    if (++missCount >= LOSE_AFTER_MISSES) {
+      led_off();
+      lastHDir = DIR_NONE;
+      lastVDir = DIR_NONE;
+      apply_dir(DIR_NONE);
+    }
+  }
 }
