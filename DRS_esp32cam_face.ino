@@ -1,11 +1,12 @@
 /*
-  DRS_ESP32CAM_VGA_DRV8833_FACE_BRAKE_CONTINUOUS_0DEG.ino
+  DRS_ESP32CAM_VGA_DRV8833_FACE_ADAPTIVE_BRAKE_CONTINUOUS_0DEG.ino
 
   - AI-Thinker ESP32-CAM (OV2640)
   - VGA 640x480, RGB565
   - Face detect MSR01 (full frame)
   - DRV8833 motor driver
-  - CONTINUOUS motor drive + short ACTIVE BRAKE
+  - CONTINUOUS motor drive
+  - Adaptive ACTIVE BRAKE on stop / direction change (stronger near target / larger error)
   - Anti-pendulum: hysteresis + minimum hold time (H + V)
   - LED (GPIO4): VERY DIM ON if face detected, OFF otherwise
   - NO SERIAL OUTPUT
@@ -63,24 +64,32 @@ static const int         XCLK_FREQ  = 20000000;
 /* ===== Face detector ===== */
 static HumanFaceDetectMSR01 detector(0.15F, 0.5F, 10, 0.2F);
 
-/* ===== Control tuning ===== */
-static const int DEADZONE_X = 60;
-static const int DEADZONE_Y = 40;
-static const uint32_t DETECT_MIN_MS = 30;
+/* ===== Speed & robustness ===== */
+static const uint32_t DETECT_MIN_MS = 30;   // fast reaction (try 25..35)
 static const uint8_t  LOSE_AFTER_MISSES = 2;
 
-/* ===== Anti-pendulum (both axes) =====
-   HYST_* adds extra pixels beyond deadzone before allowing movement on that axis
-   HOLD_DIR_MS_* prevents rapid direction flip-flops on that axis
-*/
-static const int      HYST_X = 45;         // try 30..80
-static const int      HYST_Y = 35;         // try 20..70 (usually a bit smaller)
-static const uint32_t HOLD_DIR_MS_H = 100; // try 150..400
-static const uint32_t HOLD_DIR_MS_V = 100; // try 120..350
+/* ===== Deadzone ===== */
+static const int DEADZONE_X = 40;
+static const int DEADZONE_Y = 40;
 
-/* ===== Brake tuning ===== */
-static const uint32_t BRAKE_MS_V = 35;   // vertical
-static const uint32_t BRAKE_MS_H = 70;   // horizontal (stronger)
+/* ===== Anti-pendulum (both axes) ===== */
+static const int      HYST_X = 45;         // pixels beyond deadzone to allow H motion
+static const int      HYST_Y = 45;         // pixels beyond deadzone to allow V motion
+static const uint32_t HOLD_DIR_MS_H = 240; // minimum hold against L<->R flip
+static const uint32_t HOLD_DIR_MS_V = 240; // minimum hold against U<->D flip
+
+/* ===== Adaptive brake =====
+   Brake time is mapped from (effective error) -> [MIN..MAX] per axis.
+   effective error = max(0, abs(error) - deadzone)
+*/
+static const uint32_t BRAKE_MIN_H = 18;
+static const uint32_t BRAKE_MAX_H = 120;
+static const uint32_t BRAKE_MIN_V = 18;
+static const uint32_t BRAKE_MAX_V = 120;
+
+// scale factor: how much error corresponds to "full brake"
+static const int ERR_FULL_H = 140;   // ~max useful horizontal error beyond deadzone
+static const int ERR_FULL_V = 180;
 
 enum Dir : int8_t {
   DIR_NONE  = 0,
@@ -94,13 +103,18 @@ enum Dir : int8_t {
 static uint32_t lastDetectMs = 0;
 static uint8_t  missCount   = 0;
 static int imgW = 640, imgH = 480;
+
 static Dir lastDir = DIR_NONE;
 
-// axis memory
+// axis memory for anti-pendulum
 static Dir lastHDir = DIR_NONE;
 static uint32_t lastHChangeMs = 0;
 static Dir lastVDir = DIR_NONE;
 static uint32_t lastVChangeMs = 0;
+
+// last measured errors (for adaptive braking)
+static int lastErrH = 0;  // abs(dx)
+static int lastErrV = 0;  // abs(dy)
 
 /* ===== LED ===== */
 static void led_pwm_init() {
@@ -137,6 +151,19 @@ static inline void motor_drive(Dir d) {
     case DIR_LEFT:  digitalWrite(PIN_LEFT, HIGH);  break;
     case DIR_RIGHT: digitalWrite(PIN_RIGHT, HIGH); break;
     default: break;
+  }
+}
+
+/* ===== Utils ===== */
+static inline int clampi(int v, int lo, int hi){ return (v<lo)?lo:((v>hi)?hi:v); }
+
+static uint32_t map_brake_ms(int errEff, bool horizontal){
+  if(horizontal){
+    int e = clampi(errEff, 0, ERR_FULL_H);
+    return BRAKE_MIN_H + (uint32_t)((BRAKE_MAX_H - BRAKE_MIN_H) * (uint32_t)e / (uint32_t)ERR_FULL_H);
+  }else{
+    int e = clampi(errEff, 0, ERR_FULL_V);
+    return BRAKE_MIN_V + (uint32_t)((BRAKE_MAX_V - BRAKE_MIN_V) * (uint32_t)e / (uint32_t)ERR_FULL_V);
   }
 }
 
@@ -192,12 +219,15 @@ static bool bestFace(std::list<dl::detect::result_t>& r, int& cx, int& cy) {
   return found;
 }
 
-/* ===== Direction decision (0°) with anti-pendulum on both axes ===== */
+/* ===== Direction decision (0°) + anti-pendulum both axes ===== */
 static Dir decide_dir(int cx, int cy) {
   const int dx  = cx - imgW/2;
   const int dy  = cy - imgH/2;
   const int adx = abs(dx);
   const int ady = abs(dy);
+
+  lastErrH = adx;
+  lastErrV = ady;
 
   if (adx <= DEADZONE_X && ady <= DEADZONE_Y) return DIR_NONE;
 
@@ -231,7 +261,7 @@ static Dir decide_dir(int cx, int cy) {
   }
 }
 
-/* ===== Apply with axis-specific brake ===== */
+/* ===== Apply with adaptive axis-specific brake ===== */
 static void apply_dir(Dir d) {
   if (d == lastDir) {
     if (d == DIR_NONE) motor_coast();
@@ -244,12 +274,28 @@ static void apply_dir(Dir d) {
   bool newH  = (d==DIR_LEFT || d==DIR_RIGHT);
   bool newV  = (d==DIR_UP   || d==DIR_DOWN);
 
+  // effective errors beyond deadzone (0..)
+  int errEffH = max(0, lastErrH - DEADZONE_X);
+  int errEffV = max(0, lastErrV - DEADZONE_Y);
+
+  // brake duration: choose based on axis involved
+  uint32_t tH = map_brake_ms(errEffH, true);
+  uint32_t tV = map_brake_ms(errEffV, false);
+
   motor_coast();
 
   if (lastH || newH) brake_horizontal();
   if (lastV || newV) brake_vertical();
 
-  delay((lastH||newH) ? BRAKE_MS_H : BRAKE_MS_V);
+  // If both axes involved, brake for the longer of the two demands
+  uint32_t t = 0;
+  if ((lastH||newH) && (lastV||newV)) t = (tH > tV) ? tH : tV;
+  else if (lastH||newH)              t = tH;
+  else if (lastV||newV)              t = tV;
+
+  // short, adaptive brake
+  if (t > 0) delay(t);
+
   motor_coast();
 
   if (d != DIR_NONE) motor_drive(d);
